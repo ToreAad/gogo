@@ -19,4 +19,5 @@ func getHashes(rows int, cols int) map[state]int {
 			}
 		}
 	}
+	return res
 }

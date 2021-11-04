@@ -39,6 +39,12 @@ func (gs *GoString) copy() *GoString {
 	return &GoString{gs.color, stones, liberties}
 }
 
+func (gs *GoString) withoutLiberty(p Point) *GoString {
+	new_string := gs.copy()
+	new_string.removeLiberty(p)
+	return new_string
+}
+
 func (gs *GoString) removeLiberty(p Point) {
 	delete(gs.liberties, p)
 }
@@ -107,9 +113,15 @@ func (gs *GoString) equals(o *GoString) bool {
 }
 
 type Board struct {
-	Rows int
-	Cols int
-	grid map[Point]*GoString
+	Rows     int
+	Cols     int
+	grid     map[Point]*GoString
+	hash     int
+	zoobrist map[state]int
+}
+
+func makeBoard(r int, c int) *Board {
+	return &Board{r, c, make(map[Point]*GoString), 0, getHashes(r, c)}
 }
 
 func (b *Board) copy() *Board {
@@ -117,7 +129,7 @@ func (b *Board) copy() *Board {
 	for p, gs := range b.grid {
 		grid[p] = gs.copy()
 	}
-	return &Board{b.Rows, b.Cols, grid}
+	return &Board{b.Rows, b.Cols, grid, b.hash, b.zoobrist}
 }
 
 func (b *Board) equals(o *Board) bool {
@@ -134,10 +146,6 @@ func (b *Board) equals(o *Board) bool {
 		}
 	}
 	return true
-}
-
-func makeBoard(r int, c int) *Board {
-	return &Board{r, c, make(map[Point]*GoString)}
 }
 
 func (b *Board) IsOnBoard(p Point) bool {
@@ -165,6 +173,12 @@ func (b *Board) getGoString(p Point) (*GoString, error) {
 	return v, nil
 }
 
+func (b *Board) replaceString(newString *GoString) {
+	for p := range newString.stones {
+		b.grid[p] = newString
+	}
+}
+
 func (b *Board) removeString(gs *GoString) {
 	for p := range gs.stones {
 		for _, neighbour := range p.Neighbours() {
@@ -173,9 +187,11 @@ func (b *Board) removeString(gs *GoString) {
 				continue
 			}
 			if neigbour_string != gs {
-				gs.addLiberty(p)
+				neigbour_string.addLiberty(p)
+				b.replaceString(neigbour_string)
 			}
 		}
+		b.hash ^= b.zoobrist[state{p, gs.color}]
 		delete(b.grid, p)
 	}
 }
@@ -187,6 +203,13 @@ func contains(arr []*GoString, gs *GoString) bool {
 		}
 	}
 	return false
+}
+
+func (b *Board) isSelfCapture(player PlayerColor, point Point) bool {
+	nextBoard := b.copy()
+	nextBoard.placeStone(player, point)
+	newString, _ := nextBoard.getGoString(point)
+	return newString != nil && newString.liberties != nil && len(newString.liberties) == 0
 }
 
 func (b *Board) placeStone(player PlayerColor, p Point) error {
@@ -232,11 +255,13 @@ func (b *Board) placeStone(player PlayerColor, p Point) error {
 	for new_string_point := range new_string.stones {
 		b.grid[new_string_point] = new_string
 	}
+	b.hash ^= b.zoobrist[state{p, Empty}]
+	b.hash ^= b.zoobrist[state{p, player}]
 	for _, other_color_string := range adjacentOppositeColor {
-		other_color_string.removeLiberty(p)
-	}
-	for _, other_color_string := range adjacentOppositeColor {
-		if len(other_color_string.liberties) == 0 {
+		replacement_string := other_color_string.withoutLiberty(p)
+		if len(replacement_string.liberties) > 0 {
+			b.replaceString(replacement_string)
+		} else {
 			b.removeString(other_color_string)
 		}
 	}
@@ -248,6 +273,10 @@ type GameState struct {
 	NextPlayer    PlayerColor
 	previousState *GameState
 	lastMove      Move
+}
+
+func NewGame(n int) *GameState {
+	return &GameState{makeBoard(n, n), Black, nil, nil}
 }
 
 func (g *GameState) ApplyMove(move Move) (*GameState, error) {
@@ -286,11 +315,6 @@ func (g *GameState) IsOver() bool {
 	return false
 }
 
-func NewGame(n int) *GameState {
-	board := makeBoard(n, n)
-	return &GameState{board, Black, nil, nil}
-}
-
 func (gs *GameState) isMoveSelfCapture(player PlayerColor, move Move) (bool, error) {
 	switch m := move.(type) {
 	case *Pass:
@@ -298,29 +322,26 @@ func (gs *GameState) isMoveSelfCapture(player PlayerColor, move Move) (bool, err
 	case *Resign:
 		return false, nil
 	case *Play:
-		nextBoard := gs.Board.copy()
-		nextBoard.placeStone(player, m.Point)
-		newString, _ := nextBoard.getGoString(m.Point)
-		return newString != nil && newString.liberties != nil && len(newString.liberties) == 0, nil
+		return gs.Board.isSelfCapture(player, m.Point), nil
 	default:
 		return false, errors.New("unknown move type")
 	}
 }
 
 func (gs *GameState) situation() *Situation {
-	if gs.previousState == nil {
-		return &Situation{gs.NextPlayer, nil}
-	}
-	return &Situation{gs.NextPlayer, gs.previousState.Board}
+	// if gs.previousState == nil {
+	// 	return &Situation{gs.NextPlayer, 0}
+	// }
+	return &Situation{gs.NextPlayer, gs.Board.hash}
 }
 
 type Situation struct {
 	nextPlayer PlayerColor
-	board      *Board
+	hash       int
 }
 
 func (s *Situation) equals(o *Situation) bool {
-	return s.nextPlayer == o.nextPlayer && s.board.equals(o.board)
+	return s.nextPlayer == o.nextPlayer && s.hash == o.hash
 }
 
 func (gs *GameState) doesMoveViolateKo(player PlayerColor, move Move) (bool, error) {
@@ -332,7 +353,7 @@ func (gs *GameState) doesMoveViolateKo(player PlayerColor, move Move) (bool, err
 	case *Play:
 		nextBoard := gs.Board.copy()
 		nextBoard.placeStone(player, m.Point)
-		nextSituation := &Situation{player.otherPlayer(), nextBoard}
+		nextSituation := &Situation{player.otherPlayer(), nextBoard.hash}
 		for pastState := gs.previousState; pastState != nil; pastState = pastState.previousState {
 			if pastState.situation().equals(nextSituation) {
 				return true, nil
